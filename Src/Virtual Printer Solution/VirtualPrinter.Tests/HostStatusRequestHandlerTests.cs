@@ -77,13 +77,16 @@ namespace VirtualPrinter.Tests
 
 			(bool closeConnection, string responseData) = await handler.HandleRequest(printerConfig.Object, labelConfig, "~HS");
 
-			Assert.True(closeConnection);
+			Assert.False(closeConnection);
 			Assert.NotNull(responseData);
-			Assert.Contains("<STX>", responseData);
-			Assert.Contains("<ETX>", responseData);
+			Assert.Contains('\x02', responseData);
+			Assert.Contains('\x03', responseData);
 
 			string[] lines = responseData.Split(["\r\n"], StringSplitOptions.RemoveEmptyEntries);
 			Assert.Equal(3, lines.Length);
+			Assert.Equal("\u0002000,0,0,1219,000,0,0,0,000,0,0,0\u0003", lines[0]);
+			Assert.Equal("\u0002000,0,0,0,1,2,0,0,00000000,1,000\u0003", lines[1]);
+			Assert.Equal("\u00020000,0\u0003", lines[2]);
 		}
 
 		[Fact]
@@ -102,7 +105,7 @@ namespace VirtualPrinter.Tests
 
 			(_, string responseData) = await handler.HandleRequest(printerConfig.Object, labelConfig, "~HS");
 
-			Assert.StartsWith("<STX>", responseData.Trim().Split(["\r\n"], StringSplitOptions.None)[0]);
+			Assert.StartsWith("\x02", responseData.Trim().Split(["\r\n"], StringSplitOptions.None)[0]);
 		}
 	}
 }

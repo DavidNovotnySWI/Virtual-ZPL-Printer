@@ -42,7 +42,10 @@ namespace VirtualPrinter.Handler.HostStatus
 
 		protected override Task<(bool, string)> OnHandleRequest(IPrinterConfiguration printerConfiguration, ILabelConfiguration labelConfiguration, string requestData)
 		{
-			(bool closeConnection, string responseData) = (true, null);
+			// Zebra OPOS keeps the raw TCP connection open after a status poll and
+			// sends the print job on that same connection. Do not signal the TCP
+			// session to close after replying to ~HS.
+			(bool closeConnection, string responseData) = (false, null);
 
 			//
 			// Status request.
@@ -55,9 +58,14 @@ namespace VirtualPrinter.Handler.HostStatus
 			this.Logger.LogDebug("The ~HS handler is returning the printer status.");
 			int height = (int)(labelConfiguration.Dpmm * new Length(labelConfiguration.LabelHeight, labelConfiguration.Unit).ToUnit(LengthUnit.Millimeter).Value);
 
-			string string1 = $"<STX>000,0,0,{height},0,0,0,0,000,0,0,0<ETX>\r\n";
-			string string2 = $"<STX>000,0,0,0,1,2,0,0,00000000,1,000<ETX>\r\n";
-			string string3 = $"<STX>none,0<ETX>\r\n";
+			const char stx = '\x02';
+			const char etx = '\x03';
+
+			// These fields are fixed-width in Zebra's protocol.  Some Zebra OPOS
+			// service-object versions parse them by position rather than by delimiter.
+			string string1 = $"{stx}000,0,0,{height:D4},000,0,0,0,000,0,0,0{etx}\r\n";
+			string string2 = $"{stx}000,0,0,0,1,2,0,0,00000000,1,000{etx}\r\n";
+			string string3 = $"{stx}0000,0{etx}\r\n";
 
 			responseData = $"{string1}{string2}{string3}";
 
