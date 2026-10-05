@@ -17,6 +17,7 @@
 using System.Net.Sockets;
 using System.Security.RightsManagement;
 using System.Text;
+using System.Text.RegularExpressions;
 using ImageCache.Abstractions;
 using Labelary.Abstractions;
 using Microsoft.Extensions.Logging;
@@ -73,13 +74,13 @@ namespace VirtualPrinter.HostedService.TcpSystem
 			this.Logger.LogDebug("Getting the network stream for communications.");
 			using (NetworkStream networkStream = client.GetStream())
 			{
-				//
-				// Prepare a memory stream to read data into.
-				//
-				using (MemoryStream ms = new())
+				bool closeConnection = false;
+
+				while (client.Connected && networkStream.CanRead && !closeConnection)
 				{
-					if (client.Connected && networkStream.CanRead)
+					using (MemoryStream ms = new())
 					{
+						bool graphicDownloadAcknowledged = false;
 						this.Logger.LogInformation("The incoming connection is connected and can be read.");
 
 						//
@@ -93,15 +94,22 @@ namespace VirtualPrinter.HostedService.TcpSystem
 						// Create time stamp and cancellation token.
 						//
 						DateTime timestamp = DateTime.Now;
-						CancellationTokenSource tokenSource = new();
+						using CancellationTokenSource tokenSource = new();
 
-						while ((networkStream.DataAvailable && networkStream.CanRead) || !tokenSource.Token.IsCancellationRequested)
+						while (!tokenSource.Token.IsCancellationRequested)
 						{
 							//
 							// Read available data.
 							//
 							int numBytesRead = await networkStream.ReadAsync(data, tokenSource.Token);
-							string requestData = encoding.GetString(data);
+							if (numBytesRead == 0)
+							{
+								this.Logger.LogInformation("The client closed the connection.");
+								closeConnection = true;
+								break;
+							}
+
+							string requestData = encoding.GetString(data, 0, numBytesRead);
 							this.Logger.LogDebug("Data received: '{data}'.", requestData);
 
 							//
@@ -125,29 +133,45 @@ namespace VirtualPrinter.HostedService.TcpSystem
 								//
 								string newChunk = encoding.GetString(data, 0, numBytesRead);
 
+							// Zebra OPOS can poll status in the middle of a format. A real
+							// printer answers that preparser command immediately, then keeps
+							// accepting the unfinished ^XA ... ^XZ format. Do the same here.
+							if (newChunk.Trim().Equals("~HS", StringComparison.OrdinalIgnoreCase))
+							{
+								ms.SetLength(ms.Length - numBytesRead);
+
+								IRequestHandler statusHandler = await this.RequestHandlerFactory.GetHandlerAsync("~HS");
+								(_, string statusResponse) = await statusHandler.HandleRequest(printerConfiguration, labelConfiguration, "~HS");
+
+								if (statusResponse != null)
+								{
+									this.Logger.LogDebug("Sending in-stream ~HS response data: '{data}'.", statusResponse);
+									await networkStream.WriteAsync(encoding.GetBytes(statusResponse));
+									await networkStream.FlushAsync();
+								}
+
+								continue;
+							}
+
+							// ~DG is a complete command once its declared ASCII-hex payload
+							// length has arrived; it is not terminated by ^XZ. Zebra's legacy
+							// OPOS service object waits for XON before it sends the later ^XG
+							// and MarkFeed format, so acknowledge the completed download.
+							if (!graphicDownloadAcknowledged && IsCompleteGraphicDownload(encoding.GetString(ms.GetBuffer(), 0, (int)ms.Length)))
+							{
+								this.Logger.LogDebug("The ~DG graphic download is complete. Sending XON flow-control acknowledgement.");
+								await networkStream.WriteAsync(new byte[] { 0x11 });
+								await networkStream.FlushAsync();
+								graphicDownloadAcknowledged = true;
+							}
+
 								if (newChunk.TrimEnd().EndsWith("^XZ", StringComparison.OrdinalIgnoreCase))
 								{
 									tokenSource.Cancel();
 								}
 							}
-							else
-							{
-								//
-								// Check if we are past the wait time.
-								//
-								if (DateTime.Now.Subtract(timestamp) > TimeSpan.FromMilliseconds(this.Settings.MaximumWaitTime))
-								{
-									tokenSource.Cancel();
-								}
-							}
-
 							this.Logger.LogInformation("{count} additional byte(s) were read from the incoming connection.", numBytesRead);
 						}
-					}
-					else
-					{
-						this.Logger.LogWarning("The incoming connection is not connected or cannot be read.");
-					}
 
 					//
 					// Only process the request if data was received.
@@ -170,7 +194,7 @@ namespace VirtualPrinter.HostedService.TcpSystem
 						//
 						//  Call the handler.
 						//
-						(bool closeConnection, string responseData) = (true, string.Empty);
+						(bool closeAfterRequest, string responseData) = (true, string.Empty);
 
 						try
 						{
@@ -178,7 +202,7 @@ namespace VirtualPrinter.HostedService.TcpSystem
 							// Get the handler for this request.
 							//
 							this.Logger.LogDebug("Calling {handler}.handleRequest().", requestHandler.GetType().Name);
-							(closeConnection, responseData) = await requestHandler.HandleRequest(printerConfiguration, labelConfiguration, requestData);
+							(closeAfterRequest, responseData) = await requestHandler.HandleRequest(printerConfiguration, labelConfiguration, requestData);
 
 							//
 							// If the handler provided a response, send it back.
@@ -188,6 +212,7 @@ namespace VirtualPrinter.HostedService.TcpSystem
 								this.Logger.LogDebug("Sending response data: '{data}'.", responseData);
 								byte[] buffer = encoding.GetBytes(responseData);
 								await networkStream.WriteAsync(buffer);
+								await networkStream.FlushAsync();
 							}
 							else
 							{
@@ -198,31 +223,14 @@ namespace VirtualPrinter.HostedService.TcpSystem
 						{
 							this.Logger.LogError(ex, $"Exception occurred in {nameof(TcpListenerClientHandler)} while calling the request handler.");
 						}
-						finally
+						closeConnection = closeAfterRequest;
+						if (closeConnection)
 						{
-							//
-							// Close the connection if the handler indicated to do so.
-							//
-							if (closeConnection)
-							{
-								this.Logger.LogInformation("Closing the client connection.");
-
-								if (networkStream != null)
-								{
-									networkStream.Close();
-									networkStream.Dispose();
-								}
-
-								if (client != null)
-								{
-									client.Close();
-									client.Dispose();
-								}
-							}
-							else
-							{
-								this.Logger.LogInformation("Leaving the client connection open.");
-							}
+							this.Logger.LogInformation("Closing the client connection.");
+						}
+						else
+						{
+							this.Logger.LogInformation("Keeping the client connection open for the next request.");
 						}
 					}
 					else
@@ -231,11 +239,25 @@ namespace VirtualPrinter.HostedService.TcpSystem
 					}
 				}
 			}
+			}
 
 			//
 			// Fire the completion event.
 			//
 			this.OnCompleted?.Invoke(this, new EventArgs());
+		}
+
+		private static bool IsCompleteGraphicDownload(string requestData)
+		{
+			Match match = Regex.Match(requestData, @"~DG[^,]*,(?<bytes>\d+),\d+,", RegexOptions.IgnoreCase);
+			if (!match.Success || !int.TryParse(match.Groups["bytes"].Value, out int expectedBytes))
+			{
+				return false;
+			}
+
+			string graphicData = requestData[(match.Index + match.Length)..];
+			int hexCharacterCount = graphicData.Count(Uri.IsHexDigit);
+			return hexCharacterCount >= expectedBytes * 2;
 		}
 	}
 }
